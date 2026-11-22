@@ -11,7 +11,7 @@ import tempfile
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-import timings  # noqa: E402
+import test_timings as timings  # noqa: E402
 
 
 def run_output(argv):

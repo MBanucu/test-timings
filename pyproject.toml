@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "test-timings"
+dynamic = ["version"]
+description = "Per-test timings in SQLite: a run's ETA, its history, and a regression gate"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "GPL-3.0-only"
+license-files = ["LICENSE"]
+authors = [{ name = "MBanucu", email = "MBanucu@users.noreply.github.com" }]
+keywords = ["testing", "timing", "benchmark", "eta", "regression", "sqlite", "ci"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Software Development :: Testing",
+    "Topic :: System :: Monitoring",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/MBanucu/test-timings"
+Source = "https://github.com/MBanucu/test-timings"
+Issues = "https://github.com/MBanucu/test-timings/issues"
+
+[project.scripts]
+test-timings = "test_timings:cli"
+
+# One module, not a package: the tool is a single file so that copying it into a
+# test directory works as well as installing it.
+[tool.setuptools]
+py-modules = ["test_timings"]
+
+[tool.setuptools.dynamic]
+version = { attr = "test_timings.__version__" }

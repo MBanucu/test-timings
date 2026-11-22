@@ -21,13 +21,16 @@ not, the spent time is the sum of the tests already recorded. `--order` puts the
 remaining tests in the order the run will run them, which is what names the test
 in progress and what counts a test the history has not seen yet.
 
-    python3 timings.py record  --log run.log --run 1699999999
-    python3 timings.py eta     --class suite.e2e --run 1699999999 --log run.log
-    python3 timings.py eta     --class suite.e2e --run 1699999999 \
+    test-timings record  --log run.log --run 1699999999
+    test-timings eta     --class suite.e2e --run 1699999999 --log run.log
+    test-timings eta     --class suite.e2e --run 1699999999 \
         --log run.log --order "pty tui session" --started 1699999990
-    python3 timings.py history [--class suite.e2e]
-    python3 timings.py steps   [--run 1699999999]
-    python3 timings.py check   --log run.log --run 1699999999
+    test-timings history [--class suite.e2e]
+    test-timings steps   [--run 1699999999]
+    test-timings check   --log run.log --run 1699999999
+
+It is also a single file with nothing but the standard library behind it, so
+`python3 test_timings.py <command>` works from a checkout with no install.
 
 `check` is the regression gate: every test in the log whose median is long
 enough to judge has to have finished within `--max-regression` percent of it,
@@ -47,6 +50,8 @@ import statistics
 import sys
 import time
 from datetime import datetime, timedelta, timezone
+
+__version__ = "0.2.0"
 
 LINE = re.compile(r"timing: (\S+)#(\S+) (\d+)ms (passed|failed)")
 STEP = re.compile(r"step:(.+?) (\d+)ms\b")
@@ -346,6 +351,7 @@ def main(argv):
     common.add_argument("--db", default=argparse.SUPPRESS)
 
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--version", action="version", version="%(prog)s " + __version__)
     parser.add_argument("--db", default=DEFAULT_DB, help="SQLite file to use")
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -395,5 +401,10 @@ def main(argv):
     return args.handler(args)
 
 
-if __name__ == "__main__":
+def cli():
+    """The `test-timings` command installed by pip."""
     raise SystemExit(main(sys.argv[1:]))
+
+
+if __name__ == "__main__":
+    cli()

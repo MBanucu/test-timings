@@ -2,3 +2,7 @@ __pycache__/
 *.pyc
 .timings.db
 tests/*.db
+dist/
+build/
+*.egg-info/
+.venv/

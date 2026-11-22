@@ -93,22 +93,61 @@ or `TEST_TIMINGS_DB` in the environment, names another file. It is plain SQLite
 (`timings` and `steps` tables), so any client can query it and a CI job can cache
 it between runs to keep the history that the gate compares against.
 
-## Usage
-
-Copy `timings.py` next to your test scripts, or fetch a pinned release:
+## Install
 
 ```sh
-curl -fsSLO https://raw.githubusercontent.com/MBanucu/test-timings/v0.1.0/timings.py
-python3 timings.py history
+pip install test-timings
+
+test-timings --version      # test-timings 0.2.0
+test-timings history
 ```
 
-Python 3.10 or newer; standard library only.
+Python 3.10 or newer; standard library only, no dependencies. The distribution is
+`test-timings`, the module is `test_timings`, and the command is `test-timings`,
+so nothing shadows the `timings` name that another package already has.
+
+Without pip, the file on its own is still the whole tool — copy `test_timings.py`
+next to your test scripts and call it:
+
+```sh
+python3 test_timings.py history
+```
+
+or, in CI, fetch the file from a pinned release and check it:
+
+```sh
+curl -fsSLO https://raw.githubusercontent.com/MBanucu/test-timings/v0.2.0/test_timings.py
+python3 test_timings.py check --log run.log --run "$CI_RUN_ID"
+```
 
 ## Tests
 
 ```sh
 python3 -m unittest discover -s tests
 ```
+
+CI runs them on 3.10, 3.12 and 3.13, then builds the sdist and the wheel, installs
+each into its own virtualenv and runs the installed command, because the tests
+against the checkout would not notice packaging that ships the wrong thing.
+
+## Releasing
+
+The version is in `test_timings.__version__`, and `pyproject.toml` takes it from
+there, so there is one number to change. Tag that number:
+
+```sh
+git commit -am "0.2.0" && git tag -a v0.2.0 -m "0.2.0" && git push origin main v0.2.0
+```
+
+The tag runs `.github/workflows/release.yml`, which refuses a tag that disagrees
+with the module, tests, builds, installs the wheel, and uploads to PyPI with
+[trusted publishing](https://docs.pypi.org/trusted-publishers/) — no token is
+stored in this repository. PyPI has to trust the workflow once:
+
+- Project: `test-timings` (for the first upload, a *pending publisher* with these
+  fields is what creates it)
+- Owner: `MBanucu`, repository: `test-timings`
+- Workflow: `release.yml`, environment: `pypi`
 
 ## Licence
 
