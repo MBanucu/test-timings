@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+.timings.db
+tests/*.db
