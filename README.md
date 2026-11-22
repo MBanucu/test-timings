@@ -142,12 +142,13 @@ git commit -am "0.2.0" && git tag -a v0.2.0 -m "0.2.0" && git push origin main v
 The tag runs `.github/workflows/release.yml`, which refuses a tag that disagrees
 with the module, tests, builds, installs the wheel, and uploads to PyPI with
 [trusted publishing](https://docs.pypi.org/trusted-publishers/) — no token is
-stored in this repository. PyPI has to trust the workflow once:
+stored in this repository and none has to be rotated. PyPI trusts this workflow
+as `MBanucu/test-timings`, workflow `release.yml`, environment `pypi`; that entry
+started as a pending publisher (which is what created the project) and is now an
+ordinary trusted publisher on the project's Publishing page.
 
-- Project: `test-timings` (for the first upload, a *pending publisher* with these
-  fields is what creates it)
-- Owner: `MBanucu`, repository: `test-timings`
-- Workflow: `release.yml`, environment: `pypi`
+0.2.0 was the first release through it, and `pip install test-timings` from the
+public index gives that wheel.
 
 ## Licence
 
