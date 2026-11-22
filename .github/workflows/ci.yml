@@ -11,7 +11,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python: ["3.9", "3.10", "3.12", "3.13"]
+        # The oldest setup-python offers for this image; 3.9 and 3.8 are not
+        # built for it, which is why the README does not claim them.
+        python: ["3.10", "3.12", "3.13"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

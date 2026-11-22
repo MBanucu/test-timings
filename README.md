@@ -102,7 +102,7 @@ curl -fsSLO https://raw.githubusercontent.com/MBanucu/test-timings/v0.1.0/timing
 python3 timings.py history
 ```
 
-Python 3.9 or newer; standard library only.
+Python 3.10 or newer; standard library only.
 
 ## Tests
 
