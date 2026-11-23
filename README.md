@@ -46,7 +46,7 @@ with its own indentation or timestamps. A `step:` line belongs to the test whose
 | `eta --class C --run R` | how much of the run is done, what is left, when it should finish |
 | `history [--class C]` | every test's run count, median, p90, min, max and last outcome |
 | `steps [--run R]` | where the time inside each test of one run went |
-| `check --log F --run R` | the gate: exit 1 if a test was much slower than its median |
+| `check --log F --run R` | the gate: exit 1 on a failed, missing or much slower test |
 
 `--run` is any identifier the caller likes (an epoch second, a CI run id). Rows
 are unique per `(run, test)`, so re-reading a log that grew is safe and repeats
@@ -85,6 +85,37 @@ is less than its own jitter.
 The log is read, not ingested: the run being judged has to be compared with what
 the suite cost *before* it, and a database that already held this run would drag
 the median towards the very number under test.
+
+`check` gates on the whole run, not only on its times:
+
+- A `timing:` line whose outcome is `failed` fails the command. Failed tests are
+  printed before the regressions, because a failure usually explains a test that
+  is missing from the rest of the log. `--ignore-failures` turns this off for a
+  suite that only wants timings.
+- `--expect N` is the number of `timing:` lines the run should have; fewer fails
+  and names how many are missing. With `--class` it counts that class's lines.
+- `--require NAME` (repeatable, a comma list is accepted) names tests that must
+  appear in the log. `--expect` and `--require` close the partial-run cases
+  without the suite having to maintain a baseline.
+- `--min-judged N` fails when fewer than N tests had a median tall enough to
+  judge. It defaults to 0, so an existing invocation is unchanged; an e2e suite
+  sets it.
+- `--dry-run` prints the same verdicts and exits 0, for a first look at a new
+  suite.
+
+Exit codes are fixed:
+
+| code | meaning |
+| --- | --- |
+| 0 | pass |
+| 1 | failed, missing or not enough judged, or a timing regression |
+| 2 | usage error |
+| 3 | no log, or no parseable `timing:` lines |
+
+Invocations without the new flags behave as before, except that a `failed` line
+now fails the gate and an empty or missing log is exit 3 rather than 1 — both
+intended fixes. `--min-judged` defaults to 0, so "nothing judged" still passes
+unless a suite asks otherwise.
 
 ## The database
 
