@@ -32,11 +32,14 @@ in progress and what counts a test the history has not seen yet.
 It is also a single file with nothing but the standard library behind it, so
 `python3 test_timings.py <command>` works from a checkout with no install.
 
-`check` is the regression gate: every test in the log whose median is long
-enough to judge has to have finished within `--max-regression` percent of it,
-and the command exits 1 naming the ones that did not. Tests under `--min-ms`
-are not judged - a two-second test moving by four hundred milliseconds is the
-machine, not the code - and tests with no history are passed over.
+`check` is the gate: every test in the log whose median is long enough to judge
+has to have finished within `--max-regression` percent of it, a `failed` line
+fails the run unless `--ignore-failures`, and `--expect`, `--require` and
+`--min-judged` say how complete a run has to be. It exits 0 on a pass, 1 on a
+failed, missing, regressed or too sparsely judged run, 2 on a usage error, and
+3 when the log is missing or holds no timings. Tests under `--min-ms` are not
+judged - a two-second test moving by four hundred milliseconds is the machine,
+not the code - and tests with no history are passed over.
 
 The database is `.timings.db` in the working directory, or the file named by
 `--db` or by `TEST_TIMINGS_DB`, and can be queried with any SQLite client.
@@ -55,6 +58,13 @@ __version__ = "0.2.0"
 
 LINE = re.compile(r"timing: (\S+)#(\S+) (\d+)ms (passed|failed)")
 STEP = re.compile(r"step:(.+?) (\d+)ms\b")
+
+EXIT_CODES = """exit codes:
+  0  passed: no failed, missing or regressed test, and enough judged
+  1  failed, missing or not enough judged, or a timing regression
+  2  usage error
+  3  no log, or no parseable timings in it
+"""
 
 
 def default_db():
@@ -267,19 +277,42 @@ def log_timings(path):
     return found
 
 
+def required_tests(values):
+    """`--require` as a list: repeated flags and comma or space lists, deduplicated."""
+    names = []
+    for value in values:
+        for name in re.split(r"[,\s]+", value):
+            if name and name not in names:
+                names.append(name)
+    return names
+
+
 def report_check(args):
-    """Fails when a test took much longer than its own recent median.
+    """Fails when a test failed, is missing, or took much longer than its median.
 
     The log is read, not ingested: the run being judged has to be compared with
     what the suite cost before it, and a database that already held this run
     would move the median towards the very number under test.
+
+    A failed test is printed first, because it usually explains a test that is
+    missing from the rest of the log.
     """
     db = connect(args.db)
     current = [row for row in log_timings(args.log)
                if not args.class_ or row[0] == args.class_]
     if not current:
         print("regression: no timings in %s" % (args.log or "the log"))
-        return 1
+        return 3
+    failed = [row for row in current if row[3] == "failed"]
+    present = set()
+    for room, test, _millis, _outcome in current:
+        present.add(test)
+        present.add("%s#%s" % (room, test))
+    missing_expected = 0
+    if args.expect is not None:
+        missing_expected = max(0, args.expect - len(current))
+    missing_required = [name for name in required_tests(args.require)
+                        if name not in present]
     judged = 0
     slower = []
     for room, test, millis, _outcome in current:
@@ -297,11 +330,28 @@ def report_check(args):
         allowed = baseline * (100 + args.max_regression) / 100.0 + args.slack_ms
         if millis > allowed:
             slower.append((test, millis, baseline, allowed))
-    if slower:
-        for test, millis, baseline, allowed in slower:
-            print("regression: %s %s, median %s, allowed %s (%+.0f%%)"
-                  % (test, seconds(millis), seconds(baseline), seconds(allowed),
-                     100.0 * (millis - baseline) / baseline))
+    short_judged = judged < args.min_judged
+    if not args.ignore_failures:
+        for _room, test, millis, _outcome in failed:
+            print("failed: %s %s" % (test, seconds(millis)))
+    if missing_expected:
+        print("missing: expected %d timing(s), found %d (%d missing)"
+              % (args.expect, len(current), missing_expected))
+    if missing_required:
+        print("missing: required test(s) not in the log: %s"
+              % ", ".join(missing_required))
+    for test, millis, baseline, allowed in slower:
+        print("regression: %s %s, median %s, allowed %s (%+.0f%%)"
+              % (test, seconds(millis), seconds(baseline), seconds(allowed),
+                 100.0 * (millis - baseline) / baseline))
+    if short_judged:
+        print("judged: %d test(s) judged, --min-judged requires %d"
+              % (judged, args.min_judged))
+    if ((failed and not args.ignore_failures) or missing_expected
+            or missing_required or slower or short_judged):
+        if args.dry_run:
+            print("dry-run: would fail (exit 1)")
+            return 0
         return 1
     print("regression: %d check(s) within %d%% of their median (%d not judged)"
           % (judged, args.max_regression, len(current) - judged))
@@ -350,7 +400,11 @@ def main(argv):
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--db", default=argparse.SUPPRESS)
 
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser = argparse.ArgumentParser(
+        description=__doc__.splitlines()[0],
+        epilog=EXIT_CODES,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     parser.add_argument("--version", action="version", version="%(prog)s " + __version__)
     parser.add_argument("--db", default=DEFAULT_DB, help="SQLite file to use")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -375,7 +429,9 @@ def main(argv):
     eta.set_defaults(handler=report_eta)
 
     check = sub.add_parser("check", parents=[common],
-                           help="fail when a test is much slower than its median")
+                           help="fail when a test is failed, missing or slower than its median",
+                           epilog=EXIT_CODES,
+                           formatter_class=argparse.RawDescriptionHelpFormatter)
     check.add_argument("--class", dest="class_", default="")
     check.add_argument("--log", required=True)
     check.add_argument("--run", required=True)
@@ -385,6 +441,16 @@ def main(argv):
                        help="medians below this are too short to judge")
     check.add_argument("--slack-ms", type=int, default=2000,
                        help="added to the allowance, so jitter does not fail")
+    check.add_argument("--expect", type=int, default=None, metavar="N",
+                       help="number of timing lines the run should have; fewer fails")
+    check.add_argument("--require", action="append", default=[], metavar="NAME",
+                       help="test that must appear; repeatable, comma list accepted")
+    check.add_argument("--min-judged", type=int, default=0, metavar="N",
+                       help="fail when fewer than N tests have a baseline to judge")
+    check.add_argument("--ignore-failures", action="store_true",
+                       help="do not fail on timing lines whose outcome is failed")
+    check.add_argument("--dry-run", action="store_true",
+                       help="print the verdicts without failing the process")
     check.set_defaults(handler=report_check)
 
     history = sub.add_parser("history", parents=[common],

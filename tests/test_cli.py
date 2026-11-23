@@ -223,11 +223,76 @@ class CheckTest(Base):
         self.assertEqual(code, 1, out)
         self.assertIn("median 4.0s", out)
 
-    def test_a_log_without_timings_fails(self):
+    def test_a_log_without_timings_is_exit_3(self):
         open(self.log, "w").close()
         code, out = self.gate()
-        self.assertEqual(code, 1)
+        self.assertEqual(code, 3)
         self.assertIn("regression: no timings", out)
+
+    def test_a_missing_log_is_exit_3(self):
+        code, out = self.gate()
+        self.assertEqual(code, 3)
+        self.assertIn("regression: no timings", out)
+
+    def test_a_failed_line_fails_even_when_the_timing_is_normal(self):
+        self.write_log("timing: suite.e2e#tui-echo 4500ms failed")
+        code, out = self.gate()
+        self.assertEqual(code, 1, out)
+        self.assertIn("failed: tui-echo 4.5s", out)
+        self.assertNotIn("regression: tui-echo", out)
+
+    def test_ignore_failures_keeps_the_timing_gate(self):
+        self.write_log("timing: suite.e2e#tui-echo 4500ms failed")
+        code, out = self.gate("--ignore-failures")
+        self.assertEqual(code, 0, out)
+        self.assertIn("1 check(s) within", out)
+
+    def test_a_failed_test_is_printed_before_a_regression(self):
+        # A failure usually explains the test after it that never ran.
+        self.write_log(
+            "timing: suite.e2e#tui-bg 500ms failed",
+            "timing: suite.e2e#tui-echo 12000ms passed",
+        )
+        code, out = self.gate()
+        self.assertEqual(code, 1, out)
+        self.assertLess(out.index("failed: tui-bg"), out.index("regression: tui-echo"))
+
+    def test_expect_names_how_many_lines_are_missing(self):
+        self.write_log(*["timing: suite.e2e#t%d 1000ms passed" % n for n in range(19)])
+        code, out = self.gate("--expect", "20")
+        self.assertEqual(code, 1, out)
+        self.assertIn("expected 20 timing(s), found 19 (1 missing)", out)
+        self.write_log("timing: suite.e2e#t19 1000ms passed", mode="a")
+        code, out = self.gate("--expect", "20")
+        self.assertEqual(code, 0, out)
+
+    def test_require_names_the_absent_tests(self):
+        self.write_log("timing: suite.e2e#diag 1000ms passed")
+        code, out = self.gate("--require", "diag,redaction")
+        self.assertEqual(code, 1, out)
+        self.assertIn("required test(s) not in the log: redaction", out)
+        # Repeated flags work the same way as the comma list.
+        self.write_log("timing: suite.e2e#redaction 1000ms passed", mode="a")
+        code, out = self.gate("--require", "diag", "--require", "redaction")
+        self.assertEqual(code, 0, out)
+
+    def test_min_judged_fails_a_fresh_database(self):
+        os.remove(self.db)
+        self.write_log("timing: suite.e2e#tui-echo 4500ms passed")
+        # Without the flag, a run with nothing to judge still passes, as before.
+        code, out = self.gate()
+        self.assertEqual(code, 0, out)
+        self.assertIn("0 check(s) within", out)
+        code, out = self.gate("--min-judged", "5")
+        self.assertEqual(code, 1, out)
+        self.assertIn("judged: 0 test(s) judged, --min-judged requires 5", out)
+
+    def test_dry_run_reports_without_failing(self):
+        self.write_log("timing: suite.e2e#tui-echo 4500ms failed")
+        code, out = self.gate("--dry-run")
+        self.assertEqual(code, 0, out)
+        self.assertIn("failed: tui-echo", out)
+        self.assertIn("dry-run: would fail (exit 1)", out)
 
 
 class StepsTest(Base):
@@ -277,6 +342,16 @@ class InterfaceTest(Base):
         finally:
             if previous is not None:
                 os.environ["TEST_TIMINGS_DB"] = previous
+
+    def test_check_help_documents_the_exit_codes_and_flags(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), self.assertRaises(SystemExit) as raised:
+            timings.main(["check", "--help"])
+        self.assertEqual(raised.exception.code, 0)
+        text = out.getvalue()
+        for word in ("--expect", "--require", "--min-judged", "--ignore-failures",
+                     "--dry-run", "exit codes:", "3  no log"):
+            self.assertIn(word, text)
 
 
 if __name__ == "__main__":
