@@ -50,7 +50,8 @@ with its own indentation or timestamps. A `step:` line belongs to the test whose
 
 `--run` is any identifier the caller likes (an epoch second, a CI run id). Rows
 are unique per `(run, test)`, so re-reading a log that grew is safe and repeats
-nothing.
+nothing. It must be **new for every run and every attempt**, and the same value
+on `record` and `check`; see [The database](#the-database).
 
 ### The estimate
 
@@ -116,6 +117,57 @@ Invocations without the new flags behave as before, except that a `failed` line
 now fails the gate and an empty or missing log is exit 3 rather than 1 — both
 intended fixes. `--min-judged` defaults to 0, so "nothing judged" still passes
 unless a suite asks otherwise.
+
+### A config file
+
+`--config PATH` reads the gate's defaults from one JSON object, with the standard
+library only:
+
+```json
+{
+  "db": ".timings/timings.db",
+  "min_ms": 3000,
+  "slack_ms": 2000,
+  "max_regression": 20,
+  "min_judged": 0,
+  "require": ["pty", "tui-symbols", "diag", "redaction"]
+}
+```
+
+Every key is optional, and a missing key keeps the built-in default. Unknown
+keys, wrong types, a missing file and invalid JSON are errors, with exit 2 and a
+message naming the file and the key, so a typo cannot silently turn a threshold
+off. `require` takes a list of names (a comma string is accepted too), and
+`--require` on the command line replaces the file's list rather than adding to
+it. The precedence is CLI flag > config > default; for the database that means
+`--db` > config `db` > `TEST_TIMINGS_DB` > `.timings.db`. Only `check` uses the
+gate keys; every command honours `db`.
+
+### A Markdown summary
+
+`check --summary PATH` appends a short table, which is what a CI job needs
+instead of grepping the log:
+
+```markdown
+## test-timings: failed
+
+| judged | slower | failed | missing |
+| --- | --- | --- | --- |
+| 2 | 1 | 0 | 0 |
+
+| test | now | median | allowed | change |
+| --- | --- | --- | --- | --- |
+| beta | 12.0s | 6.0s | 9.2s | +100% |
+```
+
+`judged`, `slower`, `failed` and `missing` are counts, and the second table names
+the three tests furthest over their own median. `missing` counts both `--expect`
+lines that did not arrive and `--require` tests that are absent. The section is
+appended, so several checks in one job all reach the file.
+
+`$GITHUB_STEP_SUMMARY` is **not** read automatically: pass it explicitly with
+`--summary "$GITHUB_STEP_SUMMARY"` so a local run can never write into a CI
+summary by accident. A summary that cannot be written is exit 2.
 
 ## Machine-readable output
 
@@ -187,9 +239,134 @@ Exit codes, whether the output is prose or JSON:
 ## The database
 
 `.timings.db` in the working directory. `--db` on either side of the subcommand,
-or `TEST_TIMINGS_DB` in the environment, names another file. It is plain SQLite
-(`timings` and `steps` tables), so any client can query it and a CI job can cache
-it between runs to keep the history that the gate compares against.
+config `db`, or `TEST_TIMINGS_DB` in the environment names another file (in that
+order). It is plain SQLite (`timings` and `steps` tables), so any client can
+query it and a CI job can cache it between runs to keep the history that the gate
+compares against.
+
+A CI cache is part of the baseline, so its key has to identify the history the
+run belongs to — branch (or the pull request's base branch) and suite:
+
+```text
+timings-<os>-<suite>-<branch>-<run_id>-<run_attempt>   # saved entry
+timings-<os>-<suite>-<branch>-                          # restore-keys prefix
+timings-<os>-<suite>-                                   # fallback for a new branch
+```
+
+The run id and attempt make each saved entry new; `restore-keys` finds the most
+recent earlier one, because a cache key cannot be overwritten. A miss is not an
+error, but it means **no history**: `check` judges nothing, and `--min-judged`
+fails. That is the intended signal that a suite has not been seeded yet, not a
+regression.
+
+`--run` must be **unique for every run** (and every attempt of a run). Rows are
+unique per `(run, test)` and `record` ignores a repeated one, so reusing an id
+silently drops the new sample that would have updated the median. It also has to
+match between `record` and `check`, and the log has to be the current run's file:
+truncate it before the suite, do not append to the previous attempt's log.
+
+## CI
+
+Copy-pasteable snippets live in [`examples/`](examples/): a GitHub Actions
+workflow (`github-actions.yml`), a plain-shell script (`shell.sh`), a sample
+config (`timings.json`), and `local-demo.sh`, which runs a fake suite twice,
+then fails the third run on a regression and writes the Markdown summary — no
+GitHub runner needed. Both CI snippets use a `timings.json` like the one above;
+drop the `--config` if you would rather keep the flags on the command line.
+
+### GitHub Actions
+
+```yaml
+env:
+  TIMINGS_DB: .timings/timings.db
+  TIMINGS_LOG: run.log
+
+steps:
+  - uses: actions/checkout@v4
+  - uses: actions/setup-python@v5
+    with:
+      python-version: "3.12"
+  - uses: actions/cache@v4
+    with:
+      path: ${{ env.TIMINGS_DB }}
+      key: timings-${{ runner.os }}-e2e-${{ github.ref_name }}-${{ github.run_id }}-${{ github.run_attempt }}
+      restore-keys: |
+        timings-${{ runner.os }}-e2e-${{ github.ref_name }}-
+        timings-${{ runner.os }}-e2e-
+  - run: |
+      python3 -m pip install test-timings==0.2.0
+      mkdir -p "$(dirname "$TIMINGS_DB")"
+      ./test/run-suite.sh > "$TIMINGS_LOG" 2>&1
+  - if: always()
+    run: |
+      test-timings record --log "$TIMINGS_LOG" \
+        --run "${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+        --db "$TIMINGS_DB" --quiet
+      set +e
+      test-timings check --log "$TIMINGS_LOG" \
+        --run "${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+        --db "$TIMINGS_DB" --expect 12 --config timings.json \
+        --json --summary "$GITHUB_STEP_SUMMARY" > verdict.json
+      status=$?
+      set -e
+      cat verdict.json
+      exit "$status"
+  - if: failure()
+    uses: actions/upload-artifact@v4
+    with:
+      name: test-timings-${{ github.run_id }}-${{ github.run_attempt }}
+      path: |
+        run.log
+        verdict.json
+```
+
+`if: always()` keeps the gate running when the suite itself failed (its log is
+still worth recording), and `if: failure()` uploads the log and JSON verdict.
+The cache is saved only when the job succeeds, so a failing run does not become
+the next baseline. `examples/github-actions.yml` is the same flow with comments
+and the suite command left as a placeholder.
+
+### Plain shell
+
+```sh
+export EXPECT=12
+export TIMINGS_DB=.timings/timings.db
+export TIMINGS_RUN="$(date -u +%Y%m%dT%H%M%S)-$$"   # unique per run
+
+./test/run-suite.sh > run.log 2>&1                  # this run's own log
+
+test-timings record --log run.log --run "$TIMINGS_RUN" --db "$TIMINGS_DB" --quiet
+
+summary=()
+if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+  summary=(--summary "$GITHUB_STEP_SUMMARY")
+fi
+test-timings check --log run.log --run "$TIMINGS_RUN" --db "$TIMINGS_DB" \
+  --expect "$EXPECT" --config timings.json --json "${summary[@]}" > verdict.json
+```
+
+`examples/shell.sh` wraps this as a script, including the installed-command /
+single-file fallback and preserving the exit code.
+
+### Seeding a new suite
+
+A gate with no history is either vacuous or noisy, so seed it deliberately:
+
+1. Run once with `check --dry-run` (and `--json` if a script reads it). Nothing
+   has a median yet, so nothing is judged; the output names the tests that will
+   be judged once they do.
+2. Record a few normal runs — three to five is enough for the median of each
+   test to be its usual self, which is the number the gate compares against.
+3. Then turn on `--min-judged N` (or `min_judged` in the config). From then on a
+   cache miss or a truncated suite fails instead of passing silently.
+
+`examples/local-demo.sh` is this flow in miniature: two records, a third run
+with one test twice as slow, exit 1, and a Markdown summary.
+
+The hand-rolled version of this gate lives in
+[`android-accessible-terminal`'s `test/timings.sh`](https://github.com/MBanucu/android-accessible-terminal/blob/main/test/timings.sh);
+[`wireless-adb-keeper` #56](https://github.com/MBanucu/wireless-adb-keeper/issues/56)
+plans the same logic in bash. Both can use this instead of maintaining it twice.
 
 ## Install
 
