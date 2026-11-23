@@ -117,6 +117,73 @@ now fails the gate and an empty or missing log is exit 3 rather than 1 — both
 intended fixes. `--min-judged` defaults to 0, so "nothing judged" still passes
 unless a suite asks otherwise.
 
+## Machine-readable output
+
+`check`, `history`, `eta` and `steps` take `--json`. The numbers are the ones
+the tables print; the human output is unchanged when the flag is absent. Every
+object has `"schema": 1`. New keys may appear in a later release, so a consumer
+should ignore the ones it does not know; `schema` changes only when an existing
+key changes meaning.
+
+`check --json` prints one object, even when the gate fails, and exits the same
+way the human path does, so a shell `if` still works:
+
+```
+$ test-timings check --class suite.e2e --log run.log --run 1699999999 \
+      --expect 4 --require pty,tui-symbols,diag,redaction --json
+{"schema": 1, "run": "1699999999", "ok": false, "judged": 1, "checks": [{"test": "pty", "millis": 400, "outcome": "passed", "verdict": "ok"}, {"test": "tui-symbols", "millis": 14200, "outcome": "passed", "median": 9800, "allowed": 13760, "verdict": "slower"}, {"test": "diag", "millis": 1200, "outcome": "failed", "verdict": "ok"}], "failed": ["diag"], "missing": ["redaction"], "reasons": ["failed: diag", "missing: expected 4 timing(s), found 3 (1 missing)", "missing: required test(s) not in the log: redaction", "slower: tui-symbols"]}
+```
+
+`checks` has one entry per timing line, in log order. `median` and `allowed`
+are present only when the test was judged; an unjudged test still has
+`"verdict": "ok"` and no baseline. `failed` names the tests whose outcome was
+`failed` (empty under `--ignore-failures`), `missing` names the `--require`
+tests that did not appear, and `reasons` says why `ok` is false. `--dry-run`
+sets `ok` from the verdicts but exits 0.
+
+`history --json` prints one object per line, so it streams and needs no array:
+
+```
+$ test-timings history --json
+{"schema": 1, "class": "suite.e2e", "test": "tui-bg", "runs": 2, "median": 7000.0, "p90": 8000, "min": 6000, "max": 8000, "last_outcome": "passed", "last_millis": 8000}
+{"schema": 1, "class": "suite.e2e", "test": "tui-echo", "runs": 2, "median": 3000.0, "p90": 4000, "min": 2000, "max": 4000, "last_outcome": "passed", "last_millis": 4000}
+```
+
+The durations are milliseconds, and `median` is the same number the table
+formats, so `seconds(median)` is the table's cell. An empty database prints
+nothing.
+
+`eta --json` prints one object with whole seconds:
+
+```
+$ test-timings eta --class suite.e2e --run 1699999999 \
+      --order "pty tui session" --started 1699999937 --json
+{"schema": 1, "done": 1, "total": 3, "spent_s": 62, "left_s": 125, "total_s": 187, "current": "tui", "finish_epoch": 1700000124, "history_runs": 8}
+```
+
+`current` and `finish_epoch` are `null` when there is no such test or no clock
+(`--started`/`--elapsed`); `total_s` is `spent_s + left_s`.
+
+`steps --json` prints one object per run:
+
+```
+$ test-timings steps --run 1699999999 --json
+{"schema": 1, "run": "1699999999", "tests": [{"test": "tui", "millis": 8200, "steps": [{"name": "install", "millis": 1200}, {"name": "launch", "millis": 900}], "outside_millis": 6100}]}
+```
+
+`outside_millis` is the part of the test's duration that no `step:` line
+covered. `--quiet` silences the human output, which is what a `record` in a
+loop wants; with `--json` the JSON is still printed.
+
+Exit codes, whether the output is prose or JSON:
+
+| code | meaning |
+| --- | --- |
+| 0 | pass |
+| 1 | failed, missing or not enough judged, or a timing regression |
+| 2 | usage error |
+| 3 | no log, or no parseable `timing:` lines |
+
 ## The database
 
 `.timings.db` in the working directory. `--db` on either side of the subcommand,

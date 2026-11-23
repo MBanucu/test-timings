@@ -5,6 +5,7 @@ Run with `python3 -m unittest discover -s tests`.
 
 import contextlib
 import io
+import json
 import os
 import sys
 import tempfile
@@ -316,6 +317,329 @@ class StepsTest(Base):
         self.assertIn("1.5s in 2 step(s), 0.5s outside them", out)
         self.assertIn("install", out)
         self.assertIn("launch", out)
+
+
+class CheckJsonTest(Base):
+    def setUp(self):
+        super().setUp()
+        self.write_db(("1", "suite.e2e", "tui-echo", 4000))
+
+    def gate(self, *extra):
+        return self.command("check", "--class", "suite.e2e", "--run", "9",
+                            "--log", self.log, "--json", *extra)
+
+    def test_a_passing_run_parses_and_exits_zero(self):
+        self.write_log("timing: suite.e2e#tui-echo 4500ms passed")
+        code, out = self.gate()
+        data = json.loads(out)
+        self.assertEqual(code, 0)
+        self.assertEqual(data["schema"], 1)
+        self.assertEqual(data["run"], "9")
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["judged"], 1)
+        self.assertEqual(data["failed"], [])
+        self.assertEqual(data["missing"], [])
+        self.assertEqual(data["reasons"], [])
+        self.assertEqual(
+            data["checks"],
+            [{"test": "tui-echo", "millis": 4500, "outcome": "passed",
+              "median": 4000, "allowed": 6800, "verdict": "ok"}],
+        )
+
+    def test_a_failing_run_still_prints_json_and_the_exit_matches_ok(self):
+        self.write_log("timing: suite.e2e#tui-echo 12000ms passed")
+        code, out = self.gate()
+        data = json.loads(out)
+        self.assertEqual(code, 1)
+        self.assertFalse(data["ok"])
+        self.assertEqual(data["checks"][0]["verdict"], "slower")
+        self.assertEqual(data["reasons"], ["slower: tui-echo"])
+
+    def test_a_failed_line_is_named(self):
+        self.write_log("timing: suite.e2e#tui-echo 4500ms failed")
+        code, out = self.gate()
+        data = json.loads(out)
+        self.assertEqual(code, 1)
+        self.assertFalse(data["ok"])
+        self.assertEqual(data["failed"], ["tui-echo"])
+        self.assertEqual(data["reasons"], ["failed: tui-echo"])
+
+    def test_missing_lines_and_required_tests_are_named(self):
+        self.write_log("timing: suite.e2e#tui-echo 4500ms passed")
+        code, out = self.gate("--expect", "2", "--require", "redaction")
+        data = json.loads(out)
+        self.assertEqual(code, 1)
+        self.assertFalse(data["ok"])
+        self.assertEqual(data["missing"], ["redaction"])
+        self.assertIn("missing: expected 2 timing(s), found 1 (1 missing)",
+                      data["reasons"])
+        self.assertIn("missing: required test(s) not in the log: redaction",
+                      data["reasons"])
+
+    def test_a_test_below_min_ms_is_a_check_without_a_median(self):
+        self.write_db(("1", "suite.e2e", "quick", 2000))
+        self.write_log("timing: suite.e2e#quick 9000ms passed")
+        code, out = self.gate()
+        data = json.loads(out)
+        self.assertEqual(code, 0)
+        check = next(row for row in data["checks"] if row["test"] == "quick")
+        self.assertEqual(check["verdict"], "ok")
+        self.assertNotIn("median", check)
+        self.assertNotIn("allowed", check)
+
+    def test_a_log_without_timings_is_still_json(self):
+        open(self.log, "w").close()
+        code, out = self.gate()
+        data = json.loads(out)
+        self.assertEqual(code, 3)
+        self.assertFalse(data["ok"])
+        self.assertEqual(data["checks"], [])
+        self.assertTrue(data["reasons"])
+
+
+class HistoryJsonTest(Base):
+    def test_one_object_per_test(self):
+        self.write_db(
+            ("1", "suite.e2e", "tui-echo", 2000),
+            ("2", "suite.e2e", "tui-echo", 4000),
+            ("1", "suite.e2e", "tui-bg", 8000),
+        )
+        code, out = self.command("history", "--json")
+        self.assertEqual(code, 0)
+        rows = [json.loads(line) for line in out.splitlines()]
+        self.assertEqual([row["test"] for row in rows], ["tui-bg", "tui-echo"])
+        echo = next(row for row in rows if row["test"] == "tui-echo")
+        self.assertEqual(echo["schema"], 1)
+        self.assertEqual(echo["class"], "suite.e2e")
+        self.assertEqual(echo["runs"], 2)
+        self.assertEqual(echo["median"], 3000)
+        self.assertEqual(echo["p90"], 4000)
+        self.assertEqual(echo["min"], 2000)
+        self.assertEqual(echo["max"], 4000)
+        self.assertEqual(echo["last_outcome"], "passed")
+        self.assertEqual(echo["last_millis"], 4000)
+
+    def test_the_medians_match_the_table_exactly(self):
+        self.write_db(
+            ("1", "suite.e2e", "odd", 2000),
+            ("2", "suite.e2e", "odd", 4001),
+            ("3", "suite.e2e", "odd", 2500),
+            ("1", "suite.e2e", "even", 1000),
+            ("2", "suite.e2e", "even", 3000),
+            ("3", "suite.e2e", "even", 2500),
+            ("4", "suite.e2e", "even", 7000),
+        )
+        code, human = self.command("history")
+        self.assertEqual(code, 0)
+        medians = {line.split()[0]: line.split()[2]
+                   for line in human.splitlines()[1:] if line.strip()}
+        code, machine = self.command("history", "--json")
+        self.assertEqual(code, 0)
+        rows = [json.loads(line) for line in machine.splitlines()]
+        self.assertEqual(len(rows), len(medians))
+        for row in rows:
+            self.assertEqual(timings.seconds(row["median"]), medians[row["test"]])
+
+    def test_an_empty_database_prints_nothing(self):
+        code, out = self.command("history", "--json")
+        self.assertEqual(code, 0)
+        self.assertEqual(out, "")
+
+
+class EtaJsonTest(Base):
+    def test_shape_and_values(self):
+        self.write_db(
+            ("1", "suite.e2e", "tui-echo", 2000),
+            ("1", "suite.e2e", "tui-bg", 6000),
+            ("2", "suite.e2e", "tui-echo", 3000),
+            ("2", "suite.e2e", "tui-bg", 8000),
+        )
+        self.write_log("timing: suite.e2e#tui-echo 2500ms passed")
+        code, out = self.command(
+            "eta", "--class", "suite.e2e", "--run", "3", "--log", self.log,
+            "--order", "tui-echo tui-bg", "--elapsed", "10", "--json",
+        )
+        data = json.loads(out)
+        self.assertEqual(code, 0)
+        self.assertEqual(data, {
+            "schema": 1,
+            "done": 1,
+            "total": 2,
+            "spent_s": 10,
+            "left_s": 7,
+            "total_s": 17,
+            "current": "tui-bg",
+            "finish_epoch": data["finish_epoch"],
+            "history_runs": 3,
+        })
+        self.assertIsInstance(data["finish_epoch"], int)
+
+    def test_without_a_clock_there_is_no_finish_epoch(self):
+        self.write_db(("1", "suite.e2e", "tui-echo", 2000))
+        code, out = self.command("eta", "--class", "suite.e2e",
+                                 "--run", "2", "--json")
+        data = json.loads(out)
+        self.assertEqual(code, 0)
+        self.assertIsNone(data["finish_epoch"])
+        self.assertEqual(data["history_runs"], 1)
+
+    def test_a_class_with_no_history_still_prints_an_object(self):
+        code, out = self.command("eta", "--class", "nothing.here",
+                                 "--run", "1", "--json")
+        data = json.loads(out)
+        self.assertEqual(code, 0)
+        self.assertEqual(data["total"], 0)
+        self.assertIsNone(data["current"])
+        self.assertIsNone(data["finish_epoch"])
+
+
+class StepsJsonTest(Base):
+    def test_shape_and_values(self):
+        self.write_log(
+            "step:install 1000ms",
+            "step:launch 500ms",
+            "timing: suite.e2e#tui-echo 2000ms passed",
+        )
+        self.command("record", "--log", self.log, "--run", "4")
+        code, out = self.command("steps", "--json")
+        data = json.loads(out)
+        self.assertEqual(code, 0)
+        self.assertEqual(data["schema"], 1)
+        self.assertEqual(data["run"], "4")
+        self.assertEqual(data["tests"], [{
+            "test": "tui-echo",
+            "millis": 2000,
+            "steps": [
+                {"name": "install", "millis": 1000},
+                {"name": "launch", "millis": 500},
+            ],
+            "outside_millis": 500,
+        }])
+
+    def test_no_timings_is_an_empty_object(self):
+        code, out = self.command("steps", "--json")
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out), {"schema": 1, "run": None, "tests": []})
+
+
+class HumanOutputTest(Base):
+    """The human path is what it was before `--json` existed; bytes and all."""
+
+    def test_history_golden(self):
+        self.write_db(
+            ("1", "suite.e2e", "tui-echo", 2000),
+            ("2", "suite.e2e", "tui-echo", 4000),
+            ("1", "suite.e2e", "tui-bg", 8000),
+        )
+        code, out = self.command("history", "--class", "suite.e2e")
+        self.assertEqual(code, 0)
+        self.assertEqual(out, (
+            "test                                         runs   median"
+            "      p90      min      max  last\n"
+            "tui-bg                                          1     8.0s"
+            "     8.0s     8.0s     8.0s  passed\n"
+            "tui-echo                                        2     3.0s"
+            "     4.0s     2.0s     4.0s  passed\n"
+        ))
+
+    def test_check_golden(self):
+        self.write_db(("1", "suite.e2e", "tui-echo", 4000))
+        self.write_log("timing: suite.e2e#tui-echo 4500ms passed")
+        code, out = self.command(
+            "check", "--class", "suite.e2e", "--run", "9", "--log", self.log)
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            out, "regression: 1 check(s) within 20% of their median"
+                 " (0 not judged)\n")
+
+    def test_eta_golden(self):
+        self.write_db(
+            ("1", "suite.e2e", "tui-echo", 2000),
+            ("1", "suite.e2e", "tui-bg", 6000),
+            ("2", "suite.e2e", "tui-echo", 3000),
+            ("2", "suite.e2e", "tui-bg", 8000),
+        )
+        self.write_log("timing: suite.e2e#tui-echo 2500ms passed")
+        code, out = self.command(
+            "eta", "--class", "suite.e2e", "--run", "3", "--log", self.log,
+            "--order", "tui-echo tui-bg",
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            out, "eta: 1/2 done, 2.5s spent, 7.0s left, 9.5s total,"
+                 " now tui-bg, 3 run(s) of history\n")
+
+    def test_steps_golden(self):
+        db = timings.connect(self.db)
+        db.execute("INSERT INTO timings (run, class, test, outcome, millis,"
+                   " recorded_at) VALUES ('4', 'suite.e2e', 'tui-echo',"
+                   " 'passed', 2000, 'x')")
+        db.execute("INSERT INTO steps (run, class, test, step, millis,"
+                   " recorded_at) VALUES ('4', 'suite.e2e', 'tui-echo',"
+                   " 'install', 1000, 'x')")
+        db.execute("INSERT INTO steps (run, class, test, step, millis,"
+                   " recorded_at) VALUES ('4', 'suite.e2e', 'tui-echo',"
+                   " 'launch', 500, 'x')")
+        db.commit()
+        code, out = self.command("steps", "--run", "4")
+        self.assertEqual(code, 0)
+        self.assertEqual(out, (
+            "run 4: 2.0s in 1 test(s)\n"
+            "  tui-echo                                             2.0s"
+            "  (1.5s in 2 step(s), 0.5s outside them)\n"
+            "      install                                          1.0s\n"
+            "      launch                                           0.5s\n"
+        ))
+
+    def test_the_json_flag_does_not_change_the_human_path(self):
+        self.write_db(
+            ("1", "suite.e2e", "tui-echo", 2000),
+            ("1", "suite.e2e", "tui-bg", 6000),
+            ("2", "suite.e2e", "tui-echo", 3000),
+            ("2", "suite.e2e", "tui-bg", 8000),
+        )
+        self.write_log(
+            "timing: suite.e2e#tui-echo 2500ms passed",
+            "timing: suite.e2e#tui-bg 9000ms passed",
+        )
+        self.command("record", "--log", self.log, "--run", "4")
+        cases = [
+            ["history", "--class", "suite.e2e"],
+            ["check", "--class", "suite.e2e", "--run", "9", "--log", self.log],
+            ["eta", "--class", "suite.e2e", "--run", "3", "--log", self.log,
+             "--order", "tui-echo tui-bg"],
+            ["steps", "--run", "4"],
+        ]
+        for argv in cases:
+            first_code, first = self.command(*argv)
+            json_code, machine = self.command(*argv, "--json")
+            json.loads(machine.splitlines()[0])
+            self.assertEqual(json_code, first_code, argv)
+            after_code, after = self.command(*argv)
+            self.assertEqual((after_code, after), (first_code, first), argv)
+
+
+class QuietTest(Base):
+    def test_record_in_a_loop_says_nothing(self):
+        self.write_log("timing: suite.e2e#tui-echo 2000ms passed")
+        code, out = self.command("record", "--log", self.log,
+                                 "--run", "1", "--quiet")
+        self.assertEqual((code, out), (0, ""))
+        db = timings.connect(self.db)
+        self.assertEqual(db.execute("SELECT COUNT(*) FROM timings").fetchone()[0], 1)
+
+    def test_quiet_keeps_the_exit_code(self):
+        self.write_db(("1", "suite.e2e", "tui-echo", 4000))
+        self.write_log("timing: suite.e2e#tui-echo 12000ms passed")
+        code, out = self.command("check", "--class", "suite.e2e", "--run", "9",
+                                 "--log", self.log, "--quiet")
+        self.assertEqual((code, out), (1, ""))
+
+    def test_json_still_prints_when_quiet(self):
+        self.write_db(("1", "suite.e2e", "tui-echo", 2000))
+        code, out = self.command("history", "--json", "--quiet")
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out)["test"], "tui-echo")
 
 
 class InterfaceTest(Base):
