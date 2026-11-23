@@ -43,9 +43,15 @@ not the code - and tests with no history are passed over.
 
 The database is `.timings.db` in the working directory, or the file named by
 `--db` or by `TEST_TIMINGS_DB`, and can be queried with any SQLite client.
+
+`--json` on `check`, `history`, `eta` and `steps` prints the same numbers for a
+machine, each object carrying a `schema` version, and leaves the human output
+byte for byte as it was. `--quiet` silences the human output, which is what a
+`record` in a loop wants.
 """
 
 import argparse
+import json
 import os
 import re
 import sqlite3
@@ -55,6 +61,11 @@ import time
 from datetime import datetime, timedelta, timezone
 
 __version__ = "0.2.0"
+
+# The version of the objects `--json` prints. It only changes when a key's
+# meaning changes; new keys are additive, so a consumer may ignore what it does
+# not know.
+OUTPUT_SCHEMA = 1
 
 LINE = re.compile(r"timing: (\S+)#(\S+) (\d+)ms (passed|failed)")
 STEP = re.compile(r"step:(.+?) (\d+)ms\b")
@@ -151,6 +162,20 @@ def seconds(millis):
     return "%.1fs" % (millis / 1000.0)
 
 
+def whole_seconds(millis):
+    """The millisecond count in whole seconds, for the machine objects."""
+    return int(millis / 1000.0 + 0.5)
+
+
+def p90_of(values):
+    """The p90 the history table has always shown, from sorted values."""
+    return values[min(len(values) - 1, round(0.9 * (len(values) - 1)))]
+
+
+def emit_json(payload):
+    print(json.dumps(payload))
+
+
 # What a test with no history at all is assumed to cost. It is the median of the
 # class when there is one; this is only for a class with a single recorded test.
 DEFAULT_ESTIMATE = 10_000
@@ -204,7 +229,9 @@ def plan(db, name, run, order=None):
 
 def report_record(args):
     db = connect(args.db)
-    print("recorded %d timing(s) for run %s" % (ingest(db, args.log, args.run), args.run))
+    added = ingest(db, args.log, args.run)
+    if not args.quiet:
+        print("recorded %d timing(s) for run %s" % (added, args.run))
     return 0
 
 
@@ -212,9 +239,6 @@ def report_eta(args):
     db = connect(args.db)
     ingest(db, args.log, args.run)
     tests, done, estimates, runs = plan(db, args.class_, args.run, args.order)
-    if not tests:
-        print("eta: no timing history yet for %s" % args.class_)
-        return 0
     left = sum(estimates.values())
     # Wall clock when the caller has it: a run pays for its install and its
     # setup before the first test, and an estimate built only from test
@@ -226,16 +250,38 @@ def report_eta(args):
     elif args.elapsed is not None:
         elapsed = max(0, args.elapsed) * 1000
     current = next((test for test in tests if test not in done), None)
+    clock_known = args.started is not None or args.elapsed is not None
+    if args.json:
+        spent_s = whole_seconds(elapsed)
+        left_s = whole_seconds(left)
+        emit_json({
+            "schema": OUTPUT_SCHEMA,
+            "done": len(done),
+            "total": len(tests),
+            "spent_s": spent_s,
+            "left_s": left_s,
+            "total_s": spent_s + left_s,
+            "current": current,
+            "finish_epoch": (int(time.time() + left / 1000.0)
+                             if left and clock_known else None),
+            "history_runs": runs,
+        })
+        return 0
+    if not tests:
+        if not args.quiet:
+            print("eta: no timing history yet for %s" % args.class_)
+        return 0
     line = ("eta: %d/%d done, %s spent, %s left, %s total"
             % (len(done), len(tests), seconds(elapsed), seconds(left),
                seconds(elapsed + left)))
     if current:
         line += ", now %s" % current
-    if left and (args.started is not None or args.elapsed is not None):
+    if left and clock_known:
         line += ", finish %s" % (datetime.now()
                                   + timedelta(milliseconds=left)).strftime("%H:%M:%S")
     line += ", %d run(s) of history" % runs
-    print(line)
+    if not args.quiet:
+        print(line)
     return 0
 
 
@@ -249,17 +295,41 @@ def report_history(args):
     for room, test, millis, outcome in rows:
         entry = grouped.setdefault((room, test), {"millis": [], "outcome": outcome})
         entry["millis"].append(millis)
+        # The table's "last" column has always shown the first result in
+        # insertion order; keep that byte for byte. The JSON says what the
+        # column means, so it carries the actual last run and its duration.
+        entry["last_outcome"] = outcome
+        entry["last_millis"] = millis
     if not grouped:
-        print("no timings recorded yet")
+        if not args.json and not args.quiet:
+            print("no timings recorded yet")
+        return 0
+    if args.json:
+        for (room, test), entry in grouped.items():
+            values = sorted(entry["millis"])
+            emit_json({
+                "schema": OUTPUT_SCHEMA,
+                "class": room,
+                "test": test,
+                "runs": len(values),
+                "median": statistics.median(values),
+                "p90": p90_of(values),
+                "min": values[0],
+                "max": values[-1],
+                "last_outcome": entry["last_outcome"],
+                "last_millis": entry["last_millis"],
+            })
+        return 0
+    if args.quiet:
         return 0
     print("%-44s %4s %8s %8s %8s %8s  %s"
           % ("test", "runs", "median", "p90", "min", "max", "last"))
     for (room, test), entry in grouped.items():
         values = sorted(entry["millis"])
-        p90 = values[min(len(values) - 1, round(0.9 * (len(values) - 1)))]
         print("%-44s %4d %8s %8s %8s %8s  %s"
-              % (test, len(values), seconds(statistics.median(values)), seconds(p90),
-                 seconds(values[0]), seconds(values[-1]), entry["outcome"]))
+              % (test, len(values), seconds(statistics.median(values)),
+                 seconds(p90_of(values)), seconds(values[0]), seconds(values[-1]),
+                 entry["outcome"]))
     return 0
 
 
@@ -303,7 +373,20 @@ def report_check(args):
     if not current:
         # A class filter that matches nothing is not an empty log; say which one.
         scope = " for class %s" % args.class_ if args.class_ else ""
-        print("regression: no timings in %s%s" % (args.log or "the log", scope))
+        message = "regression: no timings in %s%s" % (args.log or "the log", scope)
+        if args.json:
+            emit_json({
+                "schema": OUTPUT_SCHEMA,
+                "run": args.run,
+                "ok": False,
+                "judged": 0,
+                "checks": [],
+                "failed": [],
+                "missing": [],
+                "reasons": [message],
+            })
+        elif not args.quiet:
+            print(message)
         return 3
     failed = [row for row in current if row[3] == "failed"]
     present = set()
@@ -317,12 +400,18 @@ def report_check(args):
                         if name not in present]
     judged = 0
     slower = []
-    for room, test, millis, _outcome in current:
+    checks = []
+    for room, test, millis, outcome in current:
         past = [row[0] for row in db.execute(
             "SELECT millis FROM timings WHERE class = ? AND test = ? AND run <> ?"
             " ORDER BY id DESC LIMIT ?", (room, test, args.run, RECENT_RUNS))]
         baseline = median_of(past)
+        check = {"test": test, "millis": millis, "outcome": outcome}
         if not baseline or baseline < args.min_ms:
+            # Not judged is still a passing timing; the example in the issue
+            # shows exactly this shape for a test below --min-ms.
+            check["verdict"] = "ok"
+            checks.append(check)
             continue
         judged += 1
         # Percent alone is not a gate on a shared runner: a suite's own history
@@ -330,33 +419,65 @@ def report_check(args):
         # less than the test's jitter. The slack is added to the allowance and is
         # loud in the message.
         allowed = baseline * (100 + args.max_regression) / 100.0 + args.slack_ms
+        check["median"] = baseline
+        check["allowed"] = int(round(allowed))
+        check["verdict"] = "slower" if millis > allowed else "ok"
+        checks.append(check)
         if millis > allowed:
             slower.append((test, millis, baseline, allowed))
     short_judged = judged < args.min_judged
+    reasons = []
+    lines = []
+    failed_names = []
     if not args.ignore_failures:
         for _room, test, millis, _outcome in failed:
-            print("failed: %s %s" % (test, seconds(millis)))
+            lines.append("failed: %s %s" % (test, seconds(millis)))
+            reasons.append("failed: %s" % test)
+            if test not in failed_names:
+                failed_names.append(test)
     if missing_expected:
-        print("missing: expected %d timing(s), found %d (%d missing)"
-              % (args.expect, len(current), missing_expected))
+        line = ("missing: expected %d timing(s), found %d (%d missing)"
+                % (args.expect, len(current), missing_expected))
+        lines.append(line)
+        reasons.append(line)
     if missing_required:
-        print("missing: required test(s) not in the log: %s"
-              % ", ".join(missing_required))
+        line = ("missing: required test(s) not in the log: %s"
+                % ", ".join(missing_required))
+        lines.append(line)
+        reasons.append(line)
     for test, millis, baseline, allowed in slower:
-        print("regression: %s %s, median %s, allowed %s (%+.0f%%)"
-              % (test, seconds(millis), seconds(baseline), seconds(allowed),
-                 100.0 * (millis - baseline) / baseline))
+        lines.append("regression: %s %s, median %s, allowed %s (%+.0f%%)"
+                     % (test, seconds(millis), seconds(baseline), seconds(allowed),
+                        100.0 * (millis - baseline) / baseline))
+        reasons.append("slower: %s" % test)
     if short_judged:
-        print("judged: %d test(s) judged, --min-judged requires %d"
-              % (judged, args.min_judged))
-    if ((failed and not args.ignore_failures) or missing_expected
-            or missing_required or slower or short_judged):
-        if args.dry_run:
-            print("dry-run: would fail (exit 1)")
-            return 0
-        return 1
-    print("regression: %d check(s) within %d%% of their median (%d not judged)"
-          % (judged, args.max_regression, len(current) - judged))
+        line = ("judged: %d test(s) judged, --min-judged requires %d"
+                % (judged, args.min_judged))
+        lines.append(line)
+        reasons.append(line)
+    ok = not lines
+    if ok:
+        lines.append("regression: %d check(s) within %d%% of their median"
+                     " (%d not judged)"
+                     % (judged, args.max_regression, len(current) - judged))
+    elif args.dry_run:
+        lines.append("dry-run: would fail (exit 1)")
+    if args.json:
+        emit_json({
+            "schema": OUTPUT_SCHEMA,
+            "run": args.run,
+            "ok": ok,
+            "judged": judged,
+            "checks": checks,
+            "failed": failed_names,
+            "missing": missing_required,
+            "reasons": reasons,
+        })
+    elif not args.quiet:
+        for line in lines:
+            print(line)
+    if not ok:
+        return 0 if args.dry_run else 1
     return 0
 
 
@@ -369,14 +490,38 @@ def report_steps(args):
             "SELECT run FROM timings ORDER BY CAST(run AS INTEGER) DESC LIMIT 1"
         ).fetchone()
         if not found:
-            print("no timings recorded yet")
+            if args.json:
+                emit_json({"schema": OUTPUT_SCHEMA, "run": None, "tests": []})
+            elif not args.quiet:
+                print("no timings recorded yet")
             return 0
         run = found[0]
     rows = list(db.execute(
         "SELECT class, test, millis FROM timings WHERE run = ? ORDER BY millis DESC",
         (run,)))
     if not rows:
-        print("no timings for run %s" % run)
+        if args.json:
+            emit_json({"schema": OUTPUT_SCHEMA, "run": run, "tests": []})
+        elif not args.quiet:
+            print("no timings for run %s" % run)
+        return 0
+    if args.json:
+        tests = []
+        for room, test, millis in rows:
+            steps = list(db.execute(
+                "SELECT step, millis FROM steps"
+                " WHERE run = ? AND class = ? AND test = ? ORDER BY id",
+                (run, room, test)))
+            covered = sum(step[1] for step in steps)
+            tests.append({
+                "test": test,
+                "millis": millis,
+                "steps": [{"name": name, "millis": took} for name, took in steps],
+                "outside_millis": max(0, millis - covered),
+            })
+        emit_json({"schema": OUTPUT_SCHEMA, "run": run, "tests": tests})
+        return 0
+    if args.quiet:
         return 0
     print("run %s: %s in %d test(s)" % (run, seconds(sum(row[2] for row in rows)), len(rows)))
     for room, test, millis in rows:
@@ -401,6 +546,8 @@ def main(argv):
     # outer one when the flag is only given once.
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--db", default=argparse.SUPPRESS)
+    common.add_argument("--quiet", action="store_true", default=argparse.SUPPRESS,
+                        help="silence human output")
 
     parser = argparse.ArgumentParser(
         description=__doc__.splitlines()[0],
@@ -409,6 +556,7 @@ def main(argv):
     )
     parser.add_argument("--version", action="version", version="%(prog)s " + __version__)
     parser.add_argument("--db", default=DEFAULT_DB, help="SQLite file to use")
+    parser.add_argument("--quiet", action="store_true", help="silence human output")
     sub = parser.add_subparsers(dest="command", required=True)
 
     record = sub.add_parser("record", parents=[common],
@@ -428,6 +576,8 @@ def main(argv):
                      help="epoch seconds the run began, for wall-clock spent")
     eta.add_argument("--elapsed", type=int, default=None,
                      help="seconds the run has spent so far")
+    eta.add_argument("--json", action="store_true",
+                     help="print the estimate as one JSON object")
     eta.set_defaults(handler=report_eta)
 
     check = sub.add_parser("check", parents=[common],
@@ -453,16 +603,22 @@ def main(argv):
                        help="do not fail on timing lines whose outcome is failed")
     check.add_argument("--dry-run", action="store_true",
                        help="print the verdicts without failing the process")
+    check.add_argument("--json", action="store_true",
+                       help="print the verdict as one JSON object, even on failure")
     check.set_defaults(handler=report_check)
 
     history = sub.add_parser("history", parents=[common],
                              help="per-test durations recorded so far")
     history.add_argument("--class", dest="class_", default="")
+    history.add_argument("--json", action="store_true",
+                         help="print one JSON object per test")
     history.set_defaults(handler=report_history)
 
     steps = sub.add_parser("steps", parents=[common],
                            help="where the time inside each test went")
     steps.add_argument("--run", default="")
+    steps.add_argument("--json", action="store_true",
+                       help="print the run's steps as one JSON object")
     steps.set_defaults(handler=report_steps)
 
     args = parser.parse_args(argv)
