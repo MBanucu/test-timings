@@ -301,7 +301,9 @@ def report_check(args):
     current = [row for row in log_timings(args.log)
                if not args.class_ or row[0] == args.class_]
     if not current:
-        print("regression: no timings in %s" % (args.log or "the log"))
+        # A class filter that matches nothing is not an empty log; say which one.
+        scope = " for class %s" % args.class_ if args.class_ else ""
+        print("regression: no timings in %s%s" % (args.log or "the log", scope))
         return 3
     failed = [row for row in current if row[3] == "failed"]
     present = set()

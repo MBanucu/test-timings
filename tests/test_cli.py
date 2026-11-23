@@ -234,6 +234,13 @@ class CheckTest(Base):
         self.assertEqual(code, 3)
         self.assertIn("regression: no timings", out)
 
+    def test_a_class_with_no_lines_names_the_class(self):
+        # The log has timings, just not this class's; do not claim it is empty.
+        self.write_log("timing: other#t 1000ms passed")
+        code, out = self.gate("--class", "suite.e2e")
+        self.assertEqual(code, 3, out)
+        self.assertIn("no timings in %s for class suite.e2e" % self.log, out)
+
     def test_a_failed_line_fails_even_when_the_timing_is_normal(self):
         self.write_log("timing: suite.e2e#tui-echo 4500ms failed")
         code, out = self.gate()
