@@ -1,0 +1,81 @@
+# Copy to .github/workflows/test-timings.yml, copy timings.json next to it, and
+# replace the suite command and EXPECT. The gate runs even when the suite fails,
+# so a broken run still has its log and verdict uploaded.
+name: test-timings
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  TIMINGS_DB: .timings/timings.db
+  TIMINGS_LOG: run.log
+  TIMINGS_SUITE: e2e
+  TIMINGS_CONFIG: timings.json
+  EXPECT: "12"
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Restore timing history
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.TIMINGS_DB }}
+          # Branch and suite make the cache a baseline for this line of work.
+          # run_id/run_attempt make the entry new, so a run restores the previous
+          # one through restore-keys instead of trying to overwrite a fixed key.
+          key: timings-${{ runner.os }}-${{ env.TIMINGS_SUITE }}-${{ github.ref_name }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            timings-${{ runner.os }}-${{ env.TIMINGS_SUITE }}-${{ github.ref_name }}-
+            timings-${{ runner.os }}-${{ env.TIMINGS_SUITE }}-
+
+      - name: Install test-timings
+        run: python3 -m pip install test-timings==0.2.0
+
+      - name: Run the suite
+        # `>` truncates the previous attempt: the gate must read this run's log.
+        run: |
+          mkdir -p "$(dirname "$TIMINGS_DB")"
+          ./test/run-suite.sh > "$TIMINGS_LOG" 2>&1
+
+      - name: Record timings
+        if: always()
+        # The same unique --run is used here and by the gate.
+        run: |
+          test-timings record --log "$TIMINGS_LOG" \
+            --run "${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            --db "$TIMINGS_DB" --quiet
+
+      - name: Gate
+        if: always()
+        run: |
+          set +e
+          test-timings check --log "$TIMINGS_LOG" \
+            --run "${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            --db "$TIMINGS_DB" --expect "$EXPECT" \
+            --config "$TIMINGS_CONFIG" \
+            --summary "$GITHUB_STEP_SUMMARY" --json > verdict.json
+          status=$?
+          set -e
+          cat verdict.json
+          exit "$status"
+
+      - name: Upload the log and the verdict
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-timings-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.TIMINGS_LOG }}
+            verdict.json
+          if-no-files-found: warn

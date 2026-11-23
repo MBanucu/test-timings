@@ -1,0 +1,8 @@
+{
+  "db": ".timings/timings.db",
+  "min_ms": 3000,
+  "slack_ms": 2000,
+  "max_regression": 20,
+  "min_judged": 0,
+  "require": ["pty", "tui-symbols", "diag", "redaction"]
+}

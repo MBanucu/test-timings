@@ -48,6 +48,10 @@ The database is `.timings.db` in the working directory, or the file named by
 machine, each object carrying a `schema` version, and leaves the human output
 byte for byte as it was. `--quiet` silences the human output, which is what a
 `record` in a loop wants.
+
+`--config PATH` reads gate defaults from a JSON object, and `--summary PATH`
+appends a short Markdown table for a CI job summary. A command-line flag wins
+over the file, and the file wins over the built-in default.
 """
 
 import argparse
@@ -84,6 +88,83 @@ def default_db():
 
 
 DEFAULT_DB = default_db()
+
+# `--config` may set any of these. The gate flags are resolved in `main`, after
+# argparse has said which of them the caller gave, so a flag always wins.
+CONFIG_KEYS = ("db", "max_regression", "min_judged", "min_ms", "require", "slack_ms")
+GATE_DEFAULTS = {
+    "min_ms": 3000,
+    "slack_ms": 2000,
+    "max_regression": 20.0,
+    "min_judged": 0,
+    "require": [],
+}
+
+
+class ConfigError(Exception):
+    """A `--config` file that cannot be used, with the reason in the message."""
+
+
+def load_config(path):
+    """The settings in `path`, or an empty dict when there is no `--config`."""
+    if not path:
+        return {}
+    try:
+        with open(path) as stream:
+            values = json.load(stream)
+    except OSError as error:
+        reason = error.strerror or str(error)
+        raise ConfigError("--config %s: %s" % (path, reason))
+    except json.JSONDecodeError as error:
+        raise ConfigError("--config %s: not valid JSON: %s" % (path, error))
+    if not isinstance(values, dict):
+        raise ConfigError("--config %s: must hold one JSON object" % path)
+    unknown = sorted(set(values) - set(CONFIG_KEYS))
+    if unknown:
+        raise ConfigError(
+            "--config %s: unknown key(s): %s (allowed: %s)"
+            % (path, ", ".join(unknown), ", ".join(CONFIG_KEYS)))
+    settings = {}
+    if "db" in values:
+        if not isinstance(values["db"], str) or not values["db"]:
+            raise ConfigError("--config %s: db must be a non-empty string" % path)
+        settings["db"] = values["db"]
+    for key in ("min_ms", "slack_ms", "min_judged"):
+        if key in values:
+            value = values[key]
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ConfigError("--config %s: %s must be an integer" % (path, key))
+            settings[key] = value
+    if "max_regression" in values:
+        value = values["max_regression"]
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ConfigError(
+                "--config %s: max_regression must be a number" % path)
+        settings["max_regression"] = float(value)
+    if "require" in values:
+        value = values["require"]
+        if isinstance(value, str):
+            names = [value]
+        elif isinstance(value, list) and all(isinstance(name, str) for name in value):
+            names = value
+        else:
+            raise ConfigError(
+                "--config %s: require must be a string or a list of strings" % path)
+        settings["require"] = names
+    return settings
+
+
+def apply_config(args, settings):
+    """Fills in what the command line did not say, from `settings` or defaults."""
+    if not hasattr(args, "db"):
+        args.db = settings.get("db", DEFAULT_DB)
+    # Only `check` has these flags; setting them elsewhere does no harm.
+    for key, default in GATE_DEFAULTS.items():
+        if not hasattr(args, key):
+            setattr(args, key, settings.get(key, default))
+    return args
+
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS timings (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -357,6 +438,48 @@ def required_tests(values):
     return names
 
 
+def markdown_summary(ok, judged, slower, failed, missing_required, missing_expected,
+                     dry_run=False):
+    """A short table for `$GITHUB_STEP_SUMMARY`, with the three worst timings."""
+    if ok:
+        status = "passed"
+    elif dry_run:
+        status = "would fail (dry-run)"
+    else:
+        status = "failed"
+    lines = [
+        "## test-timings: %s" % status,
+        "",
+        "| judged | slower | failed | missing |",
+        "| --- | --- | --- | --- |",
+        "| %d | %d | %d | %d |"
+        % (judged, len(slower), len(failed), len(missing_required) + missing_expected),
+        "",
+    ]
+    # The worst regressions, not the first three in the log. A test's overage
+    # relative to its own baseline is what makes one worse than another.
+    worst = sorted(slower, key=lambda row: row[1] / row[2], reverse=True)[:3]
+    if worst:
+        lines.extend([
+            "| test | now | median | allowed | change |",
+            "| --- | --- | --- | --- | --- |",
+        ])
+        for test, millis, baseline, allowed in worst:
+            lines.append("| %s | %s | %s | %s | %+.0f%% |"
+                         % (test.replace("|", "\\|"), seconds(millis),
+                            seconds(baseline), seconds(allowed),
+                            100.0 * (millis - baseline) / baseline))
+        lines.append("")
+    return "\n".join(lines)
+
+
+def append_summary(path, markdown):
+    """Appends one section, so several checks in a job all reach the summary."""
+    prefix = "\n" if os.path.exists(path) and os.path.getsize(path) else ""
+    with open(path, "a") as stream:
+        stream.write(prefix + markdown)
+
+
 def report_check(args):
     """Fails when a test failed, is missing, or took much longer than its median.
 
@@ -387,6 +510,14 @@ def report_check(args):
             })
         elif not args.quiet:
             print(message)
+        if args.summary:
+            try:
+                append_summary(args.summary, markdown_summary(
+                    False, 0, [], [], [], 0))
+            except OSError as error:
+                print("summary: cannot write %s: %s" % (args.summary, error),
+                      file=sys.stderr)
+                return 2
         return 3
     failed = [row for row in current if row[3] == "failed"]
     present = set()
@@ -476,6 +607,15 @@ def report_check(args):
     elif not args.quiet:
         for line in lines:
             print(line)
+    if args.summary:
+        try:
+            append_summary(args.summary, markdown_summary(
+                ok, judged, slower, failed_names, missing_required,
+                missing_expected, args.dry_run))
+        except OSError as error:
+            print("summary: cannot write %s: %s" % (args.summary, error),
+                  file=sys.stderr)
+            return 2
     if not ok:
         return 0 if args.dry_run else 1
     return 0
@@ -546,6 +686,7 @@ def main(argv):
     # outer one when the flag is only given once.
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--db", default=argparse.SUPPRESS)
+    common.add_argument("--config", default=argparse.SUPPRESS, metavar="PATH")
     common.add_argument("--quiet", action="store_true", default=argparse.SUPPRESS,
                         help="silence human output")
 
@@ -555,7 +696,9 @@ def main(argv):
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--version", action="version", version="%(prog)s " + __version__)
-    parser.add_argument("--db", default=DEFAULT_DB, help="SQLite file to use")
+    parser.add_argument("--db", default=argparse.SUPPRESS, help="SQLite file to use")
+    parser.add_argument("--config", default=argparse.SUPPRESS, metavar="PATH",
+                        help="JSON file with db and gate defaults")
     parser.add_argument("--quiet", action="store_true", help="silence human output")
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -587,24 +730,29 @@ def main(argv):
     check.add_argument("--class", dest="class_", default="")
     check.add_argument("--log", required=True)
     check.add_argument("--run", required=True)
-    check.add_argument("--max-regression", type=float, default=20.0,
-                       help="percent slower than the median that fails")
-    check.add_argument("--min-ms", type=int, default=3000,
-                       help="medians below this are too short to judge")
-    check.add_argument("--slack-ms", type=int, default=2000,
-                       help="added to the allowance, so jitter does not fail")
+    check.add_argument("--max-regression", type=float, default=argparse.SUPPRESS,
+                       help="percent slower than the median that fails (default 20)")
+    check.add_argument("--min-ms", type=int, default=argparse.SUPPRESS,
+                       help="medians below this are too short to judge (default 3000)")
+    check.add_argument("--slack-ms", type=int, default=argparse.SUPPRESS,
+                       help="added to the allowance, so jitter does not fail"
+                            " (default 2000)")
     check.add_argument("--expect", type=int, default=None, metavar="N",
                        help="number of timing lines the run should have; fewer fails")
-    check.add_argument("--require", action="append", default=[], metavar="NAME",
+    check.add_argument("--require", action="append", default=argparse.SUPPRESS,
+                       metavar="NAME",
                        help="test that must appear; repeatable, comma list accepted")
-    check.add_argument("--min-judged", type=int, default=0, metavar="N",
-                       help="fail when fewer than N tests have a baseline to judge")
+    check.add_argument("--min-judged", type=int, default=argparse.SUPPRESS, metavar="N",
+                       help="fail when fewer than N tests have a baseline to judge"
+                            " (default 0)")
     check.add_argument("--ignore-failures", action="store_true",
                        help="do not fail on timing lines whose outcome is failed")
     check.add_argument("--dry-run", action="store_true",
                        help="print the verdicts without failing the process")
     check.add_argument("--json", action="store_true",
                        help="print the verdict as one JSON object, even on failure")
+    check.add_argument("--summary", default=None, metavar="PATH",
+                       help="append a Markdown table to PATH, for a CI job summary")
     check.set_defaults(handler=report_check)
 
     history = sub.add_parser("history", parents=[common],
@@ -622,6 +770,11 @@ def main(argv):
     steps.set_defaults(handler=report_steps)
 
     args = parser.parse_args(argv)
+    try:
+        settings = load_config(getattr(args, "config", None))
+    except ConfigError as error:
+        parser.error(str(error))
+    apply_config(args, settings)
     return args.handler(args)
 
 
